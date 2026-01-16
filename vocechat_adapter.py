@@ -73,6 +73,8 @@ class VoceChatAdapter(Platform):
 
     def meta(self) -> PlatformMetadata: return self.metadata 
     
+
+
     async def _handle_webhook_get_request(self, request: web.Request):
         logger.info(f"VoceChatAdapter '{self.metadata.id}': 收到 Webhook URL 验证 GET 请求: {request.path}")
         return web.Response(text="Webhook GET check OK", status=200)
@@ -258,6 +260,58 @@ class VoceChatAdapter(Platform):
         if not abm.message: logger.debug(f"VoceChatAdapter '{self.metadata.id}': 最终消息列表为空 for mid {message_id_str}."); return None
         return abm
         
+
+    async def uploadFile2VoceChat(self, path: str, filename: str, mime_type: str) -> Optional[str]:
+        """上传文件到 VoceChat 服务器,返回文件信息 JSON"""
+        if not os.path.exists(path):
+            logger.error(f"文件不存在: {path}")
+            return None
+
+        url = self.server_url
+        http_client = await self._get_http_session()
+        headers = {"x-api-key": self.api_key}
+        try:
+            # 1. 准备上传
+            async with http_client.post(
+                f"{self.server_url}/api/bot/file/prepare",
+                headers={**headers, "Content-Type": "application/json"},
+                json={"content_type": mime_type, "filename": filename},
+                timeout=10
+            ) as resp:
+                if resp.status not in (200, 201):
+                    logger.error(f"文件准备失败: {resp.status} - {await resp.text()}")
+                    return None
+                file_id = (await resp.text()).strip('"')
+
+            # 2. 上传文件
+            with open(path, 'rb') as f:
+                file_data = f.read()
+
+            form_data = aiohttp.FormData()
+            form_data.add_field('file_id', file_id)
+            form_data.add_field('chunk_data', file_data, filename=filename, content_type=mime_type)
+            form_data.add_field('chunk_is_last', 'true')
+
+            async with http_client.post(
+                f"{self.server_url}/api/bot/file/upload",
+                headers=headers,
+                data=form_data,
+                timeout=30
+            ) as resp:
+                if resp.status in (200, 201):
+                    result = await resp.text()
+                    logger.info(f"文件上传成功: {filename}")
+                    return result
+                logger.error(f"文件上传失败: {resp.status} - {await resp.text()}")
+                return None
+
+        except asyncio.TimeoutError:
+            logger.error(f"文件上传超时: {path}")
+        except Exception as e:
+            logger.error(f"文件上传异常: {e}", exc_info=True)
+        return None
+
+
     async def send_by_session(self, session: MessageSesion, message_chain: MessageChain):
         # ... (此方法与你上一个提供的版本一致，为了简洁省略了) ...
         # ... (请确保你使用的是包含图片发送逻辑的最新版本) ...
@@ -286,6 +340,7 @@ class VoceChatAdapter(Platform):
                     data_to_send = content_to_send.encode('utf-8')
                     logger.debug(f"VoceChat '{self.metadata.id}': 发送 {desc_type} '{content_to_send[:50]}...' 到 {target_id_str} ({comp_desc})")
                 elif isinstance(component, Image):
+                    logger.info(f"component.file:{component.file},component.url:{component.url}")
                     if component.file and component.file.startswith("base64://"):
                         pure_base64_data = component.file.split("base64://", 1)[1]; mime_type = "image/png" ; original_filename = "image.png" # 默认值
                         if hasattr(component, 'path') and component.path: original_filename = os.path.basename(component.path)
@@ -294,7 +349,33 @@ class VoceChatAdapter(Platform):
                         data_url_for_voce = f"data:{mime_type};base64,{pure_base64_data}"
                         request_headers["Content-Type"] = "vocechat/file"; data_to_send = json.dumps({"archive_id": data_url_for_voce }).encode('utf-8')
                         logger.debug(f"VoceChat '{self.metadata.id}': 发送图片 (vocechat/file, archive_id) 到 {target_id_str} ({comp_desc})")
-                    elif component.url and component.url.startswith("http"): 
+                    # 处理本地文件
+                    elif component.file and not component.file.startswith(("http://", "https://", "base64://")):
+                        try:
+                            system_path = os.path.normpath(component.file.removeprefix("file:///"))
+                            filename = os.path.basename(system_path)
+                            mime_type = mimetypes.guess_type(filename)[0] or "image/png"
+
+                            upload_result = await self.uploadFile2VoceChat(system_path, filename, mime_type)
+                            if not upload_result:
+                                continue
+
+                            uploaded_path = json.loads(upload_result).get("path")
+                            if not uploaded_path:
+                                logger.error(f"上传响应中未找到 path 字段: {upload_result}")
+                                continue
+
+                            request_headers["Content-Type"] = "vocechat/file"
+                            data_to_send = json.dumps({"path": uploaded_path}).encode('utf-8')
+                            logger.info(f"使用上传后的文件路径发送: {uploaded_path}")
+                        except Exception as e:
+                            logger.error(f"本地文件处理失败: {e}", exc_info=True)
+                            continue
+                    # 为了兼容 Pixel 插件
+                    elif component.file and (component.file.startswith("http") or component.file.startswith("https")):
+                        logger.debug(f"VoceChat '{self.metadata.id}': 发送图片 (Markdown链接: ![]({component.file[:100]}...)) 到 {target_id_str} ({comp_desc})")
+                        request_headers["Content-Type"] = "text/markdown"; data_to_send = f"![]({component.file})".encode('utf-8')
+                    elif component.url and (component.url.startswith("http") or component.url.startswith("https")):
                         logger.debug(f"VoceChat '{self.metadata.id}': 发送图片 (Markdown链接: ![]({component.url[:100]}...)) 到 {target_id_str} ({comp_desc})")
                         request_headers["Content-Type"] = "text/markdown"; data_to_send = f"![]({component.url})".encode('utf-8')
                     else: logger.warning(f"'{self.metadata.id}' Image组件无有效file(base64://)或url(http). ({comp_desc})"); continue
