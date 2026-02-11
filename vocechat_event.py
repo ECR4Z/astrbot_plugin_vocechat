@@ -42,10 +42,10 @@ class VoceChatEvent(AstrMessageEvent):
         elif hasattr(message_obj, 'type'):
             if message_obj.type == MessageType.GROUP_MESSAGE and hasattr(message_obj, 'group_id') and message_obj.group_id:
                  session_id_for_event = message_obj.group_id
-            elif message_obj.type == MessageType.FRIEND_MESSAGE and hasattr(message_obj, 'user_id') and message_obj.user_id:
-                 session_id_for_event = message_obj.user_id
-            elif hasattr(message_obj, 'user_id') and message_obj.user_id: # 作为最后的备选
-                 session_id_for_event = message_obj.user_id
+            elif message_obj.type == MessageType.FRIEND_MESSAGE and hasattr(message_obj, 'sender') and message_obj.sender:
+                 session_id_for_event = message_obj.sender.user_id
+            elif hasattr(message_obj, 'sender') and message_obj.sender: # 作为最后的备选
+                 session_id_for_event = message_obj.sender.user_id
             else:
                 logger.warning("VoceChatEvent: message_obj 中无法提取有效的 session_id (user_id/group_id 也缺失或类型不符)")
         else:

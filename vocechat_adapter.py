@@ -71,6 +71,40 @@ class VoceChatAdapter(Platform):
             self._http_session = aiohttp.ClientSession()
         return self._http_session
 
+    async def _wait_for_port_available(self, timeout: float = 15.0) -> bool:
+        """等待端口可用（用于在重启后等待旧连接关闭）
+
+        Args:
+            timeout: 最大等待时间（秒）
+
+        Returns:
+            bool: 端口是否可用
+        """
+        import socket
+        start_time = asyncio.get_event_loop().time()
+        logger.info(f"VoceChatAdapter '{self.metadata.id}': 等待端口 {self.listen_port} 可用（最多 {timeout} 秒）...")
+
+        while True:
+            try:
+                # 尝试创建 socket 并绑定端口来检测可用性
+                test_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                test_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                test_socket.bind((self.listen_host, self.listen_port))
+                test_socket.close()
+                logger.info(f"VoceChatAdapter '{self.metadata.id}': 端口 {self.listen_port} 现在可用")
+                return True
+            except OSError:
+                elapsed = asyncio.get_event_loop().time() - start_time
+                if elapsed >= timeout:
+                    logger.warning(f"VoceChatAdapter '{self.metadata.id}': 等待端口 {self.listen_port} 可用超时")
+                    return False
+                # 等待一段时间后重试（使用可取消的 sleep）
+                try:
+                    await asyncio.sleep(0.5)
+                except asyncio.CancelledError:
+                    logger.info(f"VoceChatAdapter '{self.metadata.id}': 端口检测被取消")
+                    raise  # 重新抛出，让上层处理
+
     def meta(self) -> PlatformMetadata: return self.metadata 
     
 
@@ -101,24 +135,48 @@ class VoceChatAdapter(Platform):
             
     async def run(self):
         logger.info(f"VoceChatAdapter '{self.metadata.id}': 启动 Webhook 服务器，监听于 http://{self.listen_host}:{self.listen_port}{self.webhook_path}")
-        app = web.Application()
-        app.router.add_get(self.webhook_path, self._handle_webhook_get_request)
-        app.router.add_post(self.webhook_path, self._handle_webhook_request)
-        self._webhook_runner = web.AppRunner(app)
-        await self._webhook_runner.setup()
-        self._webhook_site = web.TCPSite(self._webhook_runner, self.listen_host, self.listen_port)
-        try:
-            await self._webhook_site.start()
-            logger.info(f"VoceChatAdapter '{self.metadata.id}': Webhook 服务器已在 http://{self.listen_host}:{self.listen_port}{self.webhook_path} 运行。")
-            await self._stop_event.wait() 
-        except asyncio.CancelledError: 
-            logger.info(f"VoceChatAdapter '{self.metadata.id}': Webhook 运行任务捕获到 CancelledError...")
-        except Exception as e: 
-            logger.error(f"VoceChatAdapter '{self.metadata.id}': Webhook 服务器错误: {e}", exc_info=True)
-        finally: 
-            logger.info(f"VoceChatAdapter '{self.metadata.id}': Webhook 服务器开始清理...")
-            await self.shutdown_server_resources()
-            logger.info(f"VoceChatAdapter '{self.metadata.id}': Webhook run 方法结束。")
+
+        # 首先等待端口可用（特别是在禁用/重新启用后）
+        if not await self._wait_for_port_available(timeout=10.0):
+            logger.error(f"VoceChatAdapter '{self.metadata.id}': 等待端口 {self.listen_port} 可用超时，放弃启动")
+
+        # 重试机制：处理其他意外错误
+        max_retries = 3
+        for attempt in range(max_retries):
+            app = web.Application()
+            app.router.add_get(self.webhook_path, self._handle_webhook_get_request)
+            app.router.add_post(self.webhook_path, self._handle_webhook_request)
+            self._webhook_runner = web.AppRunner(app)
+
+            try:
+                await self._webhook_runner.setup()
+                self._webhook_site = web.TCPSite(self._webhook_runner, self.listen_host, self.listen_port)
+                await self._webhook_site.start()
+                logger.info(f"VoceChatAdapter '{self.metadata.id}': Webhook 服务器已在 http://{self.listen_host}:{self.listen_port}{self.webhook_path} 运行。")
+                await self._stop_event.wait()
+                break  # 正常退出
+            except asyncio.CancelledError:
+                logger.info(f"VoceChatAdapter '{self.metadata.id}': Webhook 运行任务捕获到 CancelledError...")
+                break
+            except OSError as e:
+                if "10048" in str(e) or "already in use" in str(e).lower():
+                    logger.error(f"VoceChatAdapter '{self.metadata.id}': 端口 {self.listen_port} 仍被占用，即使等待后也无法启动")
+                    break
+                else:
+                    logger.error(f"VoceChatAdapter '{self.metadata.id}': Webhook 服务器网络错误: {e}", exc_info=True)
+                    if attempt < max_retries - 1:
+                        await self.shutdown_server_resources()
+                        await asyncio.sleep(1.0)
+                        continue
+                    break
+            except Exception as e:
+                logger.error(f"VoceChatAdapter '{self.metadata.id}': Webhook 服务器错误: {e}", exc_info=True)
+                break
+
+        # 清理资源（无论成功或失败）
+        logger.info(f"VoceChatAdapter '{self.metadata.id}': Webhook 服务器开始清理...")
+        await self.shutdown_server_resources()
+        logger.info(f"VoceChatAdapter '{self.metadata.id}': Webhook run 方法结束。")
 
     async def _fetch_user_nickname(self, user_id_str: str) -> str: 
         if not user_id_str or not user_id_str.strip() or not user_id_str.isdigit():
@@ -213,16 +271,15 @@ class VoceChatAdapter(Platform):
                 if isinstance(new_user_info, dict) and "uid" in new_user_info:
                     actual_new_user_id_str = str(new_user_info["uid"]); nickname_for_new_user = new_user_info.get("name", f"NewUser_{actual_new_user_id_str}")
             if actual_new_user_id_str and actual_new_user_id_str != '0' and actual_new_user_id_str != 'None': 
-                abm.type = MessageType.SYSTEM_EVENT; abm.message.append(Plain(text=f"voce_new_user_event:{actual_new_user_id_str}")); 
-                abm.user_id = actual_new_user_id_str; abm.nickname = nickname_for_new_user
-                if "gid" in target: abm.group_id = str(target["gid"]) 
-                abm.sender = MessageMember(user_id=abm.user_id, nickname=abm.nickname); abm.message_str = "新用户加入"; 
+                abm.type = MessageType.OTHER_MESSAGE; abm.message.append(Plain(text=f"voce_new_user_event:{actual_new_user_id_str}"));
+                if "gid" in target: abm.group_id = str(target["gid"])
+                abm.sender = MessageMember(user_id=actual_new_user_id_str, nickname=nickname_for_new_user); abm.message_str = "新用户加入";
                 abm.raw_message = data; abm.self_id = self.default_bot_self_uid
-                abm.session_id = abm.group_id if abm.group_id else abm.user_id; # session_id 可能是群ID或用户ID
+                abm.session_id = abm.group_id if abm.group_id else abm.sender.user_id; # session_id 可能是群ID或用户ID
                 abm.message_id = message_id_str if message_id_str and message_id_str != 'None' else str(data.get("created_at", uuid.uuid4())); return abm
             else: logger.warning(f"VoceChatAdapter '{self.metadata.id}': newuser事件, 无法确定用户ID..."); return None # 无法确定用户ID，忽略此事件
         if not from_uid_str or from_uid_str == 'None' or from_uid_str == '0': logger.warning(f"VoceChatAdapter '{self.metadata.id}': 无效发送者ID ('{from_uid_str}')."); return None
-        abm.user_id = from_uid_str; abm.nickname = await self._fetch_user_nickname(from_uid_str); abm.sender = MessageMember(user_id=abm.user_id, nickname=abm.nickname)
+        user_nickname = await self._fetch_user_nickname(from_uid_str); abm.sender = MessageMember(user_id=from_uid_str, nickname=user_nickname)
         abm.message_id = message_id_str if message_id_str and message_id_str != 'None' else str(uuid.uuid4())
         if content_type == "text/plain" or content_type == "text/markdown": abm.message_str = str(content_from_detail); abm.message.append(Plain(text=str(content_from_detail)))
         elif content_type == "vocechat/file":
@@ -254,8 +311,8 @@ class VoceChatAdapter(Platform):
             abm.message_str = str(content_from_detail) if content_from_detail else "[未知类型]"; 
             logger.warning(f"VoceChat '{self.metadata.id}': 未知 content_type: {content_type} for '{str(content_from_detail)[:50]}...'"); abm.message.append(Plain(text=str(content_from_detail))) 
         if "gid" in target and target["gid"] is not None: abm.type = MessageType.GROUP_MESSAGE; abm.group_id = str(target["gid"]); abm.session_id = abm.group_id;
-        elif "uid" in target and target["uid"] is not None: abm.type = MessageType.FRIEND_MESSAGE; abm.session_id = abm.user_id; # 私聊时，session_id为消息发送方ID
-        else: logger.warning(f"VoceChatAdapter '{self.metadata.id}': target未知({target})，根据from_uid({abm.user_id})默认为私聊."); abm.type = MessageType.FRIEND_MESSAGE; abm.session_id = abm.user_id;
+        elif "uid" in target and target["uid"] is not None: abm.type = MessageType.FRIEND_MESSAGE; abm.session_id = abm.sender.user_id; # 私聊时，session_id为消息发送方ID
+        else: logger.warning(f"VoceChatAdapter '{self.metadata.id}': target未知({target})，根据from_uid({abm.sender.user_id})默认为私聊."); abm.type = MessageType.FRIEND_MESSAGE; abm.session_id = abm.sender.user_id;
         abm.self_id = self.default_bot_self_uid ; abm.raw_message = data; 
         if not abm.message: logger.debug(f"VoceChatAdapter '{self.metadata.id}': 最终消息列表为空 for mid {message_id_str}."); return None
         return abm
@@ -391,19 +448,39 @@ class VoceChatAdapter(Platform):
             except Exception as e_send: logger.error(f"'{self.metadata.id}' 未知发送错误 ({comp_desc}): {e_send}", exc_info=True)
 
     async def shutdown_server_resources(self):
-        if self._webhook_site and hasattr(self._webhook_site, '_server') and self._webhook_site._server is not None : 
-            logger.info(f"VoceChatAdapter '{self.metadata.id}': 停止Webhook site...")
-            await self._webhook_site.stop(); self._webhook_site = None
+        # 清理 Webhook 服务器资源
         if self._webhook_runner:
-            logger.info(f"VoceChatAdapter '{self.metadata.id}': 清理Webhook AppRunner...")
-            await self._webhook_runner.cleanup(); self._webhook_runner = None
+            logger.info(f"VoceChatAdapter '{self.metadata.id}': 清理 Webhook AppRunner (包括 site 和 server)...")
+            try:
+                # 添加超时控制，防止无限等待
+                await asyncio.wait_for(self._webhook_runner.cleanup(), timeout=5.0)
+                logger.info(f"VoceChatAdapter '{self.metadata.id}': Webhook AppRunner 清理完成")
+            except asyncio.TimeoutError:
+                logger.warning(f"VoceChatAdapter '{self.metadata.id}': Webhook AppRunner 清理超时（5秒），强制继续")
+            except Exception as e:
+                logger.error(f"VoceChatAdapter '{self.metadata.id}': 清理 Webhook AppRunner 时出错: {e}", exc_info=True)
+            finally:
+                self._webhook_runner = None
+                self._webhook_site = None
+
+        # 清理 HTTP session
         if self._http_session and not self._http_session.closed:
             logger.info(f"VoceChatAdapter '{self.metadata.id}': 关闭 aiohttp session...")
-            await self._http_session.close(); self._http_session = None
+            try:
+                # 添加超时控制，防止无限等待
+                await asyncio.wait_for(self._http_session.close(), timeout=3.0)
+            except asyncio.TimeoutError:
+                logger.warning(f"VoceChatAdapter '{self.metadata.id}': 关闭 aiohttp session 超时（3秒），强制继续")
+            except Exception as e:
+                logger.error(f"VoceChatAdapter '{self.metadata.id}': 关闭 aiohttp session 时出错: {e}", exc_info=True)
+            finally:
+                self._http_session = None
 
-    async def shutdown(self): 
+    async def shutdown(self):
         logger.info(f"VoceChatAdapter '{self.metadata.id}': 开始执行 shutdown...")
-        self._stop_event.set(); await asyncio.sleep(0.1) 
-        await self.shutdown_server_resources()
+        self._stop_event.set()
+        # 注意：不在这里调用 shutdown_server_resources()
+        # 让 run() 方法的 finally 块独占清理，避免并发问题
+        # 平台管理器应该等待 run 任务完全结束
         logger.info(f"VoceChatAdapter '{self.metadata.id}': Shutdown 完成。")
 
